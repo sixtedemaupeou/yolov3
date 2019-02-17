@@ -9,24 +9,9 @@ from utils.datasets import *
 from utils.utils import *
 
 
-def detect(
-        cfg,
-        weights,
-        images,
-        output='output',
-        img_size=416,
-        conf_thres=0.3,
-        nms_thres=0.45,
-        save_txt=False,
-        save_images=True,
-        webcam=False
-):
-    device = torch_utils.select_device()
-    shutil.rmtree(output)  # delete output folder
-    os.makedirs(output)  # make new output folder
-
+def init_model(cfg, weights, img_size=416):
     # Initialize model
-    model = Darknet(cfg, img_size)
+    model = Darknet(cfg, img_size=img_size)
 
     # Load weights
     if weights.endswith('.pt'):  # pytorch format
@@ -36,25 +21,37 @@ def detect(
     else:  # darknet format
         load_darknet_weights(model, weights)
 
+    return model
+
+
+def detect(
+        model,
+        images,
+        output='output',
+        img_size=416,
+        conf_thres=0.3,
+        nms_thres=0.45,
+        save_txt=False,
+        save_images=True,
+):
+    device = torch_utils.select_device()
+    shutil.rmtree(output)  # delete output folder
+    os.makedirs(output)  # make new output folder
+
     model.to(device).eval()
 
     # Set Dataloader
-    if webcam:
-        save_images = False
-        dataloader = LoadWebcam(img_size=img_size)
-    else:
-        dataloader = LoadImages(images, img_size=img_size)
+    dataloader = LoadImages(images, img_size=img_size)
 
     # Get classes and colors
     classes = load_classes(parse_data_cfg('cfg/coco.data')['names'])
     colors = [[random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)] for _ in range(len(classes))]
 
+    result = []
+
     for i, (path, img, im0) in enumerate(dataloader):
         t = time.time()
-        if webcam:
-            print('webcam frame %g: ' % (i + 1), end='')
-        else:
-            print('image %g/%g %s: ' % (i + 1, len(dataloader), path), end='')
+        print('image %g/%g %s: ' % (i + 1, len(dataloader), path), end='')
         save_path = str(Path(output) / Path(path).name)
 
         # Get detections
@@ -89,17 +86,18 @@ def detect(
                 label = '%s %.2f' % (classes[int(cls)], conf)
                 plot_one_box([x1, y1, x2, y2], im0, label=label, color=colors[int(cls)])
 
+            result.append(detections)
+
         dt = time.time() - t
         print('Done. (%.3fs)' % dt)
 
         if save_images:  # Save generated image with detections
             cv2.imwrite(save_path, im0)
 
-        if webcam:  # Show live webcam
-            cv2.imshow(weights + ' - %.2f FPS' % (1 / dt), im0)
-
     if save_images and (platform == 'darwin'):  # linux/macos
         os.system('open ' + output + ' ' + save_path)
+
+    return result
 
 
 if __name__ == '__main__':
@@ -114,9 +112,9 @@ if __name__ == '__main__':
     print(opt)
 
     with torch.no_grad():
+        mdl = init_model(opt.cfg, opt.weights, img_size=opt.img_size)
         detect(
-            opt.cfg,
-            opt.weights,
+            mdl,
             opt.images,
             img_size=opt.img_size,
             conf_thres=opt.conf_thres,
