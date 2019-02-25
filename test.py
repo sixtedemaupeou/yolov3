@@ -6,9 +6,8 @@ from utils.utils import *
 
 
 def test(
-        cfg,
+        model,
         data_cfg,
-        weights,
         batch_size=16,
         img_size=416,
         iou_thres=0.5,
@@ -21,15 +20,6 @@ def test(
     data_cfg_dict = parse_data_cfg(data_cfg)
     nC = int(data_cfg_dict['classes'])  # number of classes (80 for COCO)
     test_path = data_cfg_dict['valid']
-
-    # Initialize model
-    model = Darknet(cfg, img_size)
-
-    # Load weights
-    if weights.endswith('.pt'):  # pytorch format
-        model.load_state_dict(torch.load(weights, map_location='cpu')['model'])
-    else:  # darknet format
-        load_darknet_weights(model, weights)
 
     model.to(device).eval()
 
@@ -131,10 +121,18 @@ if __name__ == '__main__':
     print(opt, end='\n\n')
 
     with torch.no_grad():
+        # Initialize model
+        mdl = Darknet(opt.cfg, img_size)
+
+        # Load weights
+        if opt.weights.endswith('.pt'):  # pytorch format
+            mdl.load_state_dict(torch.load(opt.weights, map_location='cpu')['model'])
+        else:  # darknet format
+            load_darknet_weights(mdl, opt.weights)
+
         mAP = test(
-            opt.cfg,
+            mdl,
             opt.data_cfg,
-            opt.weights,
             opt.batch_size,
             opt.img_size,
             opt.iou_thres,
