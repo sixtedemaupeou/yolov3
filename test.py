@@ -122,7 +122,7 @@ if __name__ == '__main__':
 
     with torch.no_grad():
         # Initialize model
-        mdl = Darknet(opt.cfg, img_size)
+        mdl = Darknet(opt.cfg, opt.img_size)
 
         # Load weights
         if opt.weights.endswith('.pt'):  # pytorch format
