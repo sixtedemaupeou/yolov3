@@ -23,7 +23,7 @@ def test(
     if platform == 'darwin':  # MacOS (local)
         test_path = data_cfg_dict['valid']
     else:  # linux (cloud, i.e. gcp)
-        test_path = '../coco/5k.part'
+        test_path = 'coco/5k.part'
     # test_path = data_cfg_dict['valid']
 
     model.to(device).eval()
