@@ -20,11 +20,9 @@ def test(
     # Configure run
     data_cfg_dict = parse_data_cfg(data_cfg)
     nC = int(data_cfg_dict['classes'])  # number of classes (80 for COCO)
-    if platform == 'darwin':  # MacOS (local)
+    test_path = 'coco/5k.part' # linux (cloud, i.e. gcp)
+    if platform.system() == 'Darwin':  # MacOS (local)
         test_path = data_cfg_dict['valid']
-    else:  # linux (cloud, i.e. gcp)
-        test_path = 'coco/5k.part'
-    # test_path = data_cfg_dict['valid']
 
     model.to(device).eval()
 
