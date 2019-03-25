@@ -1,7 +1,4 @@
 import os
-from collections import defaultdict
-
-import torch.nn as nn
 
 from utils.parse_config import *
 from utils.utils import *
@@ -16,6 +13,7 @@ def create_modules(module_defs):
     hyperparams = module_defs.pop(0)
     output_filters = [int(hyperparams['channels'])]
     module_list = nn.ModuleList()
+    yolo_layer_count = 0
     for i, module_def in enumerate(module_defs):
         modules = nn.Sequential()
 
@@ -63,11 +61,12 @@ def create_modules(module_defs):
             anchors = [float(x) for x in module_def['anchors'].split(',')]
             anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
             anchors = [anchors[i] for i in anchor_idxs]
-            num_classes = int(module_def['classes'])
-            img_height = int(hyperparams['height'])
+            nC = int(module_def['classes'])  # number of classes
+            img_size = int(hyperparams['height'])
             # Define detection layer
-            yolo_layer = YOLOLayer(anchors, num_classes, img_height, anchor_idxs, cfg=hyperparams['cfg'])
+            yolo_layer = YOLOLayer(anchors, nC, img_size, yolo_layer_count, cfg=hyperparams['cfg'])
             modules.add_module('yolo_%d' % i, yolo_layer)
+            yolo_layer_count += 1
 
         # Register module list and number of output filters
         module_list.append(modules)
@@ -99,137 +98,65 @@ class Upsample(nn.Module):
 
 
 class YOLOLayer(nn.Module):
-
-    def __init__(self, anchors, nC, img_dim, anchor_idxs, cfg):
+    def __init__(self, anchors, nC, img_size, yolo_layer, cfg):
         super(YOLOLayer, self).__init__()
 
-        anchors = [(a_w, a_h) for a_w, a_h in anchors]  # (pixels)
-        nA = len(anchors)
-
-        self.anchors = anchors
-        self.nA = nA  # number of anchors (3)
+        self.anchors = torch.FloatTensor(anchors)
+        self.nA = len(anchors)  # number of anchors (3)
         self.nC = nC  # number of classes (80)
-        self.bbox_attrs = 5 + nC
-        self.img_dim = img_dim  # from hyperparams in cfg file, NOT from parser
+        self.img_size = 0
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        create_grids(self, 32, 1, device=device)
 
-        if anchor_idxs[0] == (nA * 2):  # 6
-            stride = 32
-        elif anchor_idxs[0] == nA:  # 3
-            stride = 16
+        if ONNX_EXPORT:  # grids must be computed in __init__
+            stride = [32, 16, 8][yolo_layer]  # stride of this layer
+            if cfg.endswith('yolov3-tiny.cfg'):
+                stride *= 2
+
+            nG = int(img_size / stride)  # number grid points
+            create_grids(self, img_size, nG)
+
+    def forward(self, p, img_size, var=None):
+        if ONNX_EXPORT:
+            bs, nG = 1, self.nG  # batch size, grid size
         else:
-            stride = 8
+            bs, nG = p.shape[0], p.shape[-1]
+            if self.img_size != img_size:
+                create_grids(self, img_size, nG, p.device)
 
-        if cfg.endswith('yolov3-tiny.cfg'):
-            stride *= 2
+        # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
+        p = p.view(bs, self.nA, self.nC + 5, nG, nG).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
-        # Build anchor grids
-        nG = int(self.img_dim / stride)  # number grid points
-        self.grid_x = torch.arange(nG).repeat((nG, 1)).view((1, 1, nG, nG)).float()
-        self.grid_y = torch.arange(nG).repeat((nG, 1)).t().view((1, 1, nG, nG)).float()
-        self.anchor_wh = torch.FloatTensor([(a_w / stride, a_h / stride) for a_w, a_h in anchors])  # scale anchors
-        self.anchor_w = self.anchor_wh[:, 0].view((1, nA, 1, 1))
-        self.anchor_h = self.anchor_wh[:, 1].view((1, nA, 1, 1))
-        self.weights = class_weights()
+        if self.training:
+            return p
 
-        self.loss_means = torch.ones(6)
-        self.yolo_layer = anchor_idxs[0] / nA  # 2, 1, 0
-        self.stride = stride
-        self.nG = nG
+        elif ONNX_EXPORT:
+            grid_xy = self.grid_xy.repeat((1, self.nA, 1, 1, 1)).view((1, -1, 2))
+            anchor_wh = self.anchor_wh.repeat((1, 1, nG, nG, 1)).view((1, -1, 2)) / nG
 
-        if ONNX_EXPORT:  # use fully populated and reshaped tensors
-            self.anchor_w = self.anchor_w.repeat((1, 1, nG, nG)).view(1, -1, 1)
-            self.anchor_h = self.anchor_h.repeat((1, 1, nG, nG)).view(1, -1, 1)
-            self.grid_x = self.grid_x.repeat(1, nA, 1, 1).view(1, -1, 1)
-            self.grid_y = self.grid_y.repeat(1, nA, 1, 1).view(1, -1, 1)
-            self.grid_xy = torch.cat((self.grid_x, self.grid_y), 2)
-            self.anchor_wh = torch.cat((self.anchor_w, self.anchor_h), 2) / nG
+            # p = p.view(-1, 5 + self.nC)
+            # xy = xy + self.grid_xy[0]  # x, y
+            # wh = torch.exp(wh) * self.anchor_wh[0]  # width, height
+            # p_conf = torch.sigmoid(p[:, 4:5])  # Conf
+            # p_cls = F.softmax(p[:, 5:], 1) * p_conf  # SSD-like conf
+            # return torch.cat((xy / nG, wh, p_conf, p_cls), 1).t()
 
-    def forward(self, p, targets=None, var=None):
-        FT = torch.cuda.FloatTensor if p.is_cuda else torch.FloatTensor
-        bs = 1 if ONNX_EXPORT else p.shape[0]  # batch size
-        nG = self.nG  # number of grid points
+            p = p.view(1, -1, 5 + self.nC)
+            xy = torch.sigmoid(p[..., 0:2]) + grid_xy  # x, y
+            wh = torch.exp(p[..., 2:4]) * anchor_wh  # width, height
+            p_conf = torch.sigmoid(p[..., 4:5])  # Conf
+            p_cls = p[..., 5:]
+            # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
+            # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
+            p_cls = torch.exp(p_cls).permute((2, 1, 0))
+            p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
+            p_cls = p_cls.permute(2, 1, 0)
+            return torch.cat((xy / nG, wh, p_conf, p_cls), 2).squeeze().t()
 
-        if p.is_cuda and not self.weights.is_cuda:
-            self.grid_x, self.grid_y = self.grid_x.cuda(), self.grid_y.cuda()
-            self.anchor_w, self.anchor_h = self.anchor_w.cuda(), self.anchor_h.cuda()
-            self.weights, self.loss_means = self.weights.cuda(), self.loss_means.cuda()
-
-        # p.view(12, 255, 13, 13) -- > (12, 3, 13, 13, 80)  # (bs, anchors, grid, grid, classes + xywh)
-        p = p.view(bs, self.nA, self.bbox_attrs, nG, nG).permute(0, 1, 3, 4, 2).contiguous()  # prediction
-
-        # Training
-        if targets is not None:
-            MSELoss = nn.MSELoss()
-            BCEWithLogitsLoss = nn.BCEWithLogitsLoss()
-            CrossEntropyLoss = nn.CrossEntropyLoss()
-
-            # Get outputs
-            x = torch.sigmoid(p[..., 0])  # Center x
-            y = torch.sigmoid(p[..., 1])  # Center y
-            p_conf = p[..., 4]  # Conf
-            p_cls = p[..., 5:]  # Class
-
-            # Width and height (yolo method)
-            w = p[..., 2]  # Width
-            h = p[..., 3]  # Height
-            # width = torch.exp(w.data) * self.anchor_w
-            # height = torch.exp(h.data) * self.anchor_h
-
-            # Width and height (power method)
-            # w = torch.sigmoid(p[..., 2])  # Width
-            # h = torch.sigmoid(p[..., 3])  # Height
-            # width = ((w.data * 2) ** 2) * self.anchor_w
-            # height = ((h.data * 2) ** 2) * self.anchor_h
-
-            tx, ty, tw, th, mask, tcls = build_targets(targets, self.anchor_wh, self.nA, self.nC, nG)
-
-            tcls = tcls[mask]
-            if x.is_cuda:
-                tx, ty, tw, th, mask, tcls = tx.cuda(), ty.cuda(), tw.cuda(), th.cuda(), mask.cuda(), tcls.cuda()
-
-            # Compute losses
-            nT = sum([len(x) for x in targets])  # number of targets
-            nM = mask.sum().float()  # number of anchors (assigned to targets)
-            nB = len(targets)  # batch size
-            k = nM / nB
-            if nM > 0:
-                lx = k * MSELoss(x[mask], tx[mask])
-                ly = k * MSELoss(y[mask], ty[mask])
-                lw = k * MSELoss(w[mask], tw[mask])
-                lh = k * MSELoss(h[mask], th[mask])
-
-                lcls = (k / 4) * CrossEntropyLoss(p_cls[mask], torch.argmax(tcls, 1))
-                # lcls = (k * 10) * BCEWithLogitsLoss(p_cls[mask], tcls.float())
-            else:
-                lx, ly, lw, lh, lcls, lconf = FT([0]), FT([0]), FT([0]), FT([0]), FT([0]), FT([0])
-
-            lconf = (k * 64) * BCEWithLogitsLoss(p_conf, mask.float())
-
-            # Sum loss components
-            loss = lx + ly + lw + lh + lconf + lcls
-
-            return loss, loss.item(), lx.item(), ly.item(), lw.item(), lh.item(), lconf.item(), lcls.item(), nT
-
-        else:
-            if ONNX_EXPORT:
-                p = p.view(1, -1, 85)
-                xy = torch.sigmoid(p[..., 0:2]) + self.grid_xy  # x, y
-                width_height = torch.exp(p[..., 2:4]) * self.anchor_wh  # width, height
-                p_conf = torch.sigmoid(p[..., 4:5])  # Conf
-                p_cls = p[..., 5:85]
-
-                # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
-                # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
-                p_cls = torch.exp(p_cls).permute((2, 1, 0))
-                p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
-                p_cls = p_cls.permute(2, 1, 0)
-
-                return torch.cat((xy / nG, width_height, p_conf, p_cls), 2).squeeze().t()
-
-            p[..., 0] = torch.sigmoid(p[..., 0]) + self.grid_x  # x
-            p[..., 1] = torch.sigmoid(p[..., 1]) + self.grid_y  # y
-            p[..., 2] = torch.exp(p[..., 2]) * self.anchor_w  # width
-            p[..., 3] = torch.exp(p[..., 3]) * self.anchor_h  # height
+        else:  # inference
+            p[..., 0:2] = torch.sigmoid(p[..., 0:2]) + self.grid_xy  # xy
+            p[..., 2:4] = torch.exp(p[..., 2:4]) * self.anchor_wh  # wh yolo method
+            # p[..., 2:4] = ((torch.sigmoid(p[..., 2:4]) * 2) ** 2) * self.anchor_wh  # wh power method
             p[..., 4] = torch.sigmoid(p[..., 4])  # p_conf
             p[..., :4] *= self.stride
 
@@ -247,48 +174,55 @@ class Darknet(nn.Module):
         self.module_defs[0]['cfg'] = cfg_path
         self.module_defs[0]['height'] = img_size
         self.hyperparams, self.module_list = create_modules(self.module_defs)
-        self.img_size = img_size
-        self.loss_names = ['loss', 'x', 'y', 'w', 'h', 'conf', 'cls', 'nT']
-        self.losses = []
 
-    def forward(self, x, targets=None, var=0):
-        self.losses = defaultdict(float)
-        is_training = targets is not None
+    def forward(self, x, var=None):
+        img_size = x.shape[-1]
         layer_outputs = []
         output = []
 
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
-            if module_def['type'] in ['convolutional', 'upsample', 'maxpool']:
+            mtype = module_def['type']
+            if mtype in ['convolutional', 'upsample', 'maxpool']:
                 x = module(x)
-            elif module_def['type'] == 'route':
+            elif mtype == 'route':
                 layer_i = [int(x) for x in module_def['layers'].split(',')]
                 if len(layer_i) == 1:
                     x = layer_outputs[layer_i[0]]
                 else:
                     x = torch.cat([layer_outputs[i] for i in layer_i], 1)
-            elif module_def['type'] == 'shortcut':
+            elif mtype == 'shortcut':
                 layer_i = int(module_def['from'])
                 x = layer_outputs[-1] + layer_outputs[layer_i]
-            elif module_def['type'] == 'yolo':
-                # Train phase: get loss
-                if is_training:
-                    x, *losses = module[0](x, targets, var)
-                    for name, loss in zip(self.loss_names, losses):
-                        self.losses[name] += loss
-                # Test phase: Get detections
-                else:
-                    x = module(x)
+            elif mtype == 'yolo':
+                x = module[0](x, img_size)
                 output.append(x)
             layer_outputs.append(x)
 
-        if is_training:
-            self.losses['nT'] /= 3
-
         if ONNX_EXPORT:
             output = torch.cat(output, 1)  # merge the 3 layers 85 x (507, 2028, 8112) to 85 x 10647
-            return output[5:85].t(), output[:4].t()  # ONNX scores, boxes
+            return output[5:].t(), output[:4].t()  # ONNX scores, boxes
+        else:
+            return output if self.training else torch.cat(output, 1)
 
-        return sum(output) if is_training else torch.cat(output, 1)
+
+def get_yolo_layers(model):
+    a = [module_def['type'] == 'yolo' for module_def in model.module_defs]
+    return [i for i, x in enumerate(a) if x]  # [82, 94, 106] for yolov3
+
+
+def create_grids(self, img_size, nG, device='cpu'):
+    self.img_size = img_size
+    self.stride = img_size / nG
+
+    # build xy offsets
+    grid_x = torch.arange(nG).repeat((nG, 1)).view((1, 1, nG, nG)).float()
+    grid_y = grid_x.permute(0, 1, 3, 2)
+    self.grid_xy = torch.stack((grid_x, grid_y), 4).to(device)
+
+    # build wh gains
+    self.anchor_vec = self.anchors.to(device) / self.stride
+    self.anchor_wh = self.anchor_vec.view(1, self.nA, 1, 1, 2).to(device)
+    self.nG = torch.FloatTensor([nG]).to(device)
 
 
 def load_darknet_weights(self, weights, cutoff=-1):
@@ -299,7 +233,7 @@ def load_darknet_weights(self, weights, cutoff=-1):
     # Try to download weights if not available locally
     if not os.path.isfile(weights):
         try:
-            os.system('wget https://pjreddie.com/media/files/' + weights_file + ' -P ' + weights)
+            os.system('wget https://pjreddie.com/media/files/' + weights_file + ' -O ' + weights)
         except IOError:
             print(weights + ' not found')
 
@@ -307,7 +241,7 @@ def load_darknet_weights(self, weights, cutoff=-1):
     if weights_file == 'darknet53.conv.74':
         cutoff = 75
     elif weights_file == 'yolov3-tiny.conv.15':
-        cutoff = 16
+        cutoff = 15
 
     # Open the weights file
     fp = open(weights, 'rb')
@@ -356,11 +290,7 @@ def load_darknet_weights(self, weights, cutoff=-1):
             conv_layer.weight.data.copy_(conv_w)
             ptr += num_w
 
-
-"""
-    @:param path    - path of the new weights file
-    @:param cutoff  - save layers between 0 and cutoff (cutoff = -1 -> all are saved)
-"""
+    return cutoff
 
 
 def save_weights(self, path, cutoff=-1):

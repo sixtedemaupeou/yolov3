@@ -27,7 +27,7 @@ def init_model(cfg, weights, img_size=416):
 def detect(
         model,
         images,
-        output='output',
+        output='output',  # output folder
         img_size=416,
         conf_thres=0.3,
         nms_thres=0.45,
@@ -35,7 +35,8 @@ def detect(
         save_images=True,
 ):
     device = torch_utils.select_device()
-    shutil.rmtree(output)  # delete output folder
+    if os.path.exists(output):
+        shutil.rmtree(output)  # delete output folder
     os.makedirs(output)  # make new output folder
 
     model.to(device).eval()
@@ -67,7 +68,7 @@ def detect(
             detections = non_max_suppression(pred.unsqueeze(0), conf_thres, nms_thres)[0]
 
             # Rescale boxes from 416 to true image size
-            detections[:, :4] = scale_coords(img_size, detections[:, :4], im0.shape)
+            scale_coords(img_size, detections[:, :4], im0.shape).round()
 
             # Print results to screen
             unique_classes = detections[:, -1].cpu().unique()
@@ -103,7 +104,7 @@ def detect(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
-    parser.add_argument('--weights', type=str, default='weights/yolov3.pt', help='path to weights file')
+    parser.add_argument('--weights', type=str, default='weights/yolov3.weights', help='path to weights file')
     parser.add_argument('--images', type=str, default='data/samples', help='path to images')
     parser.add_argument('--img-size', type=int, default=32 * 13, help='size of each image dimension')
     parser.add_argument('--conf-thres', type=float, default=0.50, help='object confidence threshold')

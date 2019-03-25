@@ -1,8 +1,12 @@
+import glob
 import random
+from collections import defaultdict
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from utils import torch_utils
@@ -10,6 +14,13 @@ from utils import torch_utils
 # Set printoptions
 torch.set_printoptions(linewidth=1320, precision=5, profile='long')
 np.set_printoptions(linewidth=320, formatter={'float_kind': '{:11.5g}'.format})  # format short g, %precision=5
+
+# Prevent OpenCV from multithreading (to use PyTorch DataLoader)
+cv2.setNumThreads(0)
+
+
+def float3(x):  # format floats to 3 decimals
+    return float(format(x, '.3f'))
 
 
 def init_seeds(seed=0):
@@ -19,26 +30,25 @@ def init_seeds(seed=0):
 
 
 def load_classes(path):
-    """
-    Loads class labels at 'path'
-    """
+    # Loads class labels at 'path'
     fp = open(path, 'r')
     names = fp.read().split('\n')
     return list(filter(None, names))  # filter removes empty strings (such as last line)
 
 
-def model_info(model):  # Plots a line-by-line description of a PyTorch model
+def model_info(model):
+    # Plots a line-by-line description of a PyTorch model
     n_p = sum(x.numel() for x in model.parameters())  # number parameters
     n_g = sum(x.numel() for x in model.parameters() if x.requires_grad)  # number gradients
-    print('\n%5s %50s %9s %12s %20s %12s %12s' % ('layer', 'name', 'gradient', 'parameters', 'shape', 'mu', 'sigma'))
+    print('\n%5s %40s %9s %12s %20s %10s %10s' % ('layer', 'name', 'gradient', 'parameters', 'shape', 'mu', 'sigma'))
     for i, (name, p) in enumerate(model.named_parameters()):
         name = name.replace('module_list.', '')
-        print('%5g %50s %9s %12g %20s %12.3g %12.3g' % (
+        print('%5g %40s %9s %12g %20s %10.3g %10.3g' % (
             i, name, p.requires_grad, p.numel(), list(p.shape), p.mean(), p.std()))
-    print('Model Summary: %g layers, %g parameters, %g gradients\n' % (i + 1, n_p, n_g))
+    print('Model Summary: %g layers, %g parameters, %g gradients' % (i + 1, n_p, n_g))
 
 
-def class_weights():  # frequency of each class in coco train2014
+def coco_class_weights():  # frequency of each class in coco train2014
     weights = 1 / torch.FloatTensor(
         [187437, 4955, 30920, 6033, 3838, 4332, 3160, 7051, 7677, 9167, 1316, 1372, 833, 6757, 7355, 3302, 3776, 4671,
          6769, 5706, 3908, 903, 3686, 3596, 6200, 7920, 8779, 4505, 4272, 1862, 4698, 1962, 4403, 6659, 2402, 2689,
@@ -49,7 +59,19 @@ def class_weights():  # frequency of each class in coco train2014
     return weights
 
 
-def plot_one_box(x, img, color=None, label=None, line_thickness=None):  # Plots one bounding box on image img
+def coco80_to_coco91_class():  # converts 80-index (val2014) to 91-index (paper)
+    # https://tech.amikelive.com/node-718/what-object-categories-labels-are-in-coco-dataset/
+    # a = np.loadtxt('data/coco.names', dtype='str', delimiter='\n')
+    # b = np.loadtxt('data/coco_paper.names', dtype='str', delimiter='\n')
+    # x = [list(a[i] == b).index(True) + 1 for i in range(80)]  # darknet to coco
+    x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 31, 32, 33, 34,
+         35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+         64, 65, 67, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90]
+    return x
+
+
+def plot_one_box(x, img, color=None, label=None, line_thickness=None):
+    # Plots one bounding box on image img
     tl = line_thickness or round(0.002 * max(img.shape[0:2])) + 1  # line thickness
     color = color or [random.randint(0, 255) for _ in range(3)]
     c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
@@ -73,7 +95,7 @@ def weights_init_normal(m):
 
 def xyxy2xywh(x):
     # Convert bounding box format from [x1, y1, x2, y2] to [x, y, w, h]
-    y = torch.zeros(x.shape) if x.dtype is torch.float32 else np.zeros(x.shape)
+    y = torch.zeros_like(x) if x.dtype is torch.float32 else np.zeros_like(x)
     y[:, 0] = (x[:, 0] + x[:, 2]) / 2
     y[:, 1] = (x[:, 1] + x[:, 3]) / 2
     y[:, 2] = x[:, 2] - x[:, 0]
@@ -83,7 +105,7 @@ def xyxy2xywh(x):
 
 def xywh2xyxy(x):
     # Convert bounding box format from [x, y, w, h] to [x1, y1, x2, y2]
-    y = torch.zeros(x.shape) if x.dtype is torch.float32 else np.zeros(x.shape)
+    y = torch.zeros_like(x) if x.dtype is torch.float32 else np.zeros_like(x)
     y[:, 0] = (x[:, 0] - x[:, 2] / 2)
     y[:, 1] = (x[:, 1] - x[:, 3] / 2)
     y[:, 2] = (x[:, 0] + x[:, 2] / 2)
@@ -99,13 +121,13 @@ def scale_coords(img_size, coords, img0_shape):
     coords[:, [0, 2]] -= pad_x
     coords[:, [1, 3]] -= pad_y
     coords[:, :4] /= gain
-    coords[:, :4] = torch.round(torch.clamp(coords[:, :4], min=0))
+    coords[:, :4] = torch.clamp(coords[:, :4], min=0)
     return coords
 
 
 def ap_per_class(tp, conf, pred_cls, target_cls):
     """ Compute the average precision, given the recall and precision curves.
-    Method originally from https://github.com/rafaelpadilla/Object-Detection-Metrics.
+    Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
     # Arguments
         tp:    True positives (list).
         conf:  Objectness value from 0-1 (list).
@@ -114,9 +136,6 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
     # Returns
         The average precision as computed in py-faster-rcnn.
     """
-
-    # lists/pytorch to numpy
-    tp, conf, pred_cls, target_cls = np.array(tp), np.array(conf), np.array(pred_cls), np.array(target_cls)
 
     # Sort by objectness
     i = np.argsort(-conf)
@@ -159,7 +178,7 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
 
 def compute_ap(recall, precision):
     """ Compute the average precision, given the recall and precision curves.
-    Code originally from https://github.com/rbgirshick/py-faster-rcnn.
+    Source: https://github.com/rbgirshick/py-faster-rcnn.
     # Arguments
         recall:    The recall curve (list).
         precision: The precision curve (list).
@@ -186,115 +205,136 @@ def compute_ap(recall, precision):
 
 
 def bbox_iou(box1, box2, x1y1x2y2=True):
-    """
-    Returns the IoU of two bounding boxes
-    """
+    # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
+    box2 = box2.t()
+
+    # Get the coordinates of bounding boxes
     if x1y1x2y2:
-        # Get the coordinates of bounding boxes
-        b1_x1, b1_y1, b1_x2, b1_y2 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
-        b2_x1, b2_y1, b2_x2, b2_y2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
+        # x1, y1, x2, y2 = box1
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1[0], box1[1], box1[2], box1[3]
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
     else:
-        # Transform from center and width to exact coordinates
-        b1_x1, b1_x2 = box1[:, 0] - box1[:, 2] / 2, box1[:, 0] + box1[:, 2] / 2
-        b1_y1, b1_y2 = box1[:, 1] - box1[:, 3] / 2, box1[:, 1] + box1[:, 3] / 2
-        b2_x1, b2_x2 = box2[:, 0] - box2[:, 2] / 2, box2[:, 0] + box2[:, 2] / 2
-        b2_y1, b2_y2 = box2[:, 1] - box2[:, 3] / 2, box2[:, 1] + box2[:, 3] / 2
+        # x, y, w, h = box1
+        b1_x1, b1_x2 = box1[0] - box1[2] / 2, box1[0] + box1[2] / 2
+        b1_y1, b1_y2 = box1[1] - box1[3] / 2, box1[1] + box1[3] / 2
+        b2_x1, b2_x2 = box2[0] - box2[2] / 2, box2[0] + box2[2] / 2
+        b2_y1, b2_y2 = box2[1] - box2[3] / 2, box2[1] + box2[3] / 2
 
-    # get the coordinates of the intersection rectangle
-    inter_rect_x1 = torch.max(b1_x1, b2_x1)
-    inter_rect_y1 = torch.max(b1_y1, b2_y1)
-    inter_rect_x2 = torch.min(b1_x2, b2_x2)
-    inter_rect_y2 = torch.min(b1_y2, b2_y2)
     # Intersection area
-    inter_area = torch.clamp(inter_rect_x2 - inter_rect_x1, 0) * torch.clamp(inter_rect_y2 - inter_rect_y1, 0)
+    inter_area = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+                 (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+
     # Union Area
-    b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
-    b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+    union_area = ((b1_x2 - b1_x1) * (b1_y2 - b1_y1) + 1e-16) + \
+                 (b2_x2 - b2_x1) * (b2_y2 - b2_y1) - inter_area
 
-    return inter_area / (b1_area + b2_area - inter_area + 1e-16)
+    return inter_area / union_area  # iou
 
 
-def build_targets(target, anchor_wh, nA, nC, nG):
-    """
-    returns nT, nCorrect, tx, ty, tw, th, tconf, tcls
-    """
-    nB = len(target)  # number of images in batch
-    nT = [len(x) for x in target]  # torch.argmin(target[:, :, 4], 1)  # targets per image
-    tx = torch.zeros(nB, nA, nG, nG)  # batch size (4), number of anchors (3), number of grid points (13)
-    ty = torch.zeros(nB, nA, nG, nG)
-    tw = torch.zeros(nB, nA, nG, nG)
-    th = torch.zeros(nB, nA, nG, nG)
-    tconf = torch.ByteTensor(nB, nA, nG, nG).fill_(0)
-    tcls = torch.ByteTensor(nB, nA, nG, nG, nC).fill_(0)  # nC = number of classes
+def wh_iou(box1, box2):
+    # Returns the IoU of wh1 to wh2. wh1 is 2, wh2 is nx2
+    box2 = box2.t()
 
-    for b in range(nB):
-        nTb = nT[b]  # number of targets
-        if nTb == 0:
-            continue
-        t = target[b]
+    # w, h = box1
+    w1, h1 = box1[0], box1[1]
+    w2, h2 = box2[0], box2[1]
 
-        # Convert to position relative to box
-        gx, gy, gw, gh = t[:, 1] * nG, t[:, 2] * nG, t[:, 3] * nG, t[:, 4] * nG
+    # Intersection area
+    inter_area = torch.min(w1, w2) * torch.min(h1, h2)
 
-        # Get grid box indices and prevent overflows (i.e. 13.01 on 13 anchors)
-        gi = torch.clamp(gx.long(), min=0, max=nG - 1)
-        gj = torch.clamp(gy.long(), min=0, max=nG - 1)
+    # Union Area
+    union_area = (w1 * h1 + 1e-16) + w2 * h2 - inter_area
 
-        # iou of targets-anchors (using wh only)
-        box1 = t[:, 3:5] * nG
-        box2 = anchor_wh.unsqueeze(1)
-        inter_area = torch.min(box1, box2).prod(2)
-        iou = inter_area / (gw * gh + box2.prod(2) - inter_area + 1e-16)
+    return inter_area / union_area  # iou
 
-        # Select best iou_pred and anchor
-        iou_best, a = iou.max(0)  # best anchor [0-2] for each target
 
-        # Select best unique target-anchor combinations
-        if nTb > 1:
-            iou_order = torch.argsort(-iou_best)  # best to worst
+def compute_loss(p, targets):  # predictions, targets
+    FT = torch.cuda.FloatTensor if p[0].is_cuda else torch.FloatTensor
+    loss, lxy, lwh, lcls, lconf = FT([0]), FT([0]), FT([0]), FT([0]), FT([0])
+    txy, twh, tcls, tconf, indices = targets
+    MSE = nn.MSELoss()
+    CE = nn.CrossEntropyLoss()
+    BCE = nn.BCEWithLogitsLoss()
 
-            # Unique anchor selection
-            u = torch.cat((gi, gj, a), 0).view((3, -1))
-            _, first_unique = np.unique(u[:, iou_order], axis=1, return_index=True)  # first unique indices
-            # _, first_unique = torch.unique(u[:, iou_order], dim=1, return_inverse=True)  # different than numpy?
+    # Compute losses
+    # gp = [x.numel() for x in tconf]  # grid points
+    for i, pi0 in enumerate(p):  # layer i predictions, i
+        b, a, gj, gi = indices[i]  # image, anchor, gridx, gridy
 
-            i = iou_order[first_unique]
-            # best anchor must share significant commonality (iou) with target
-            i = i[iou_best[i] > 0.10]
-            if len(i) == 0:
-                continue
+        # Compute losses
+        k = 1  # nT / bs
+        if len(b) > 0:
+            pi = pi0[b, a, gj, gi]  # predictions closest to anchors
+            lxy += k * MSE(torch.sigmoid(pi[..., 0:2]), txy[i])  # xy
+            lwh += k * MSE(pi[..., 2:4], twh[i])  # wh
+            lcls += (k / 4) * CE(pi[..., 5:], tcls[i])
 
-            a, gj, gi, t = a[i], gj[i], gi[i], t[i]
-            if len(t.shape) == 1:
-                t = t.view(1, 5)
+        # pos_weight = FT([gp[i] / min(gp) * 4.])
+        # BCE = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        lconf += (k * 64) * BCE(pi0[..., 4], tconf[i])
+    loss = lxy + lwh + lconf + lcls
+
+    # Add to dictionary
+    d = defaultdict(float)
+    losses = [loss.item(), lxy.item(), lwh.item(), lconf.item(), lcls.item()]
+    for name, x in zip(['total', 'xy', 'wh', 'conf', 'cls'], losses):
+        d[name] = x
+
+    return loss, d
+
+
+def build_targets(model, targets, pred):
+    # targets = [image, class, x, y, w, h]
+    if isinstance(model, nn.DataParallel):
+        model = model.module
+    yolo_layers = get_yolo_layers(model)
+
+    # anchors = closest_anchor(model, targets)  # [layer, anchor, i, j]
+    txy, twh, tcls, tconf, indices = [], [], [], [], []
+    for i, layer in enumerate(yolo_layers):
+        nG = model.module_list[layer][0].nG  # grid size
+        anchor_vec = model.module_list[layer][0].anchor_vec
+
+        # iou of targets-anchors
+        gwh = targets[:, 4:6] * nG
+        iou = [wh_iou(x, gwh) for x in anchor_vec]
+        iou, a = torch.stack(iou, 0).max(0)  # best iou and anchor
+
+        # reject below threshold ious (OPTIONAL)
+        reject = True
+        if reject:
+            j = iou > 0.01
+            t, a, gwh = targets[j], a[j], gwh[j]
         else:
-            if iou_best < 0.10:
-                continue
+            t = targets
 
-        tc, gx, gy, gw, gh = t[:, 0].long(), t[:, 1] * nG, t[:, 2] * nG, t[:, 3] * nG, t[:, 4] * nG
+        # Indices
+        b, c = t[:, 0:2].long().t()  # target image, class
+        gxy = t[:, 2:4] * nG
+        gi, gj = gxy.long().t()  # grid_i, grid_j
+        indices.append((b, a, gj, gi))
 
-        # Coordinates
-        tx[b, a, gj, gi] = gx - gi.float()
-        ty[b, a, gj, gi] = gy - gj.float()
+        # XY coordinates
+        txy.append(gxy - gxy.floor())
 
-        # Width and height (yolo method)
-        tw[b, a, gj, gi] = torch.log(gw / anchor_wh[a, 0])
-        th[b, a, gj, gi] = torch.log(gh / anchor_wh[a, 1])
+        # Width and height
+        twh.append(torch.log(gwh / anchor_vec[a]))  # yolo method
+        # twh.append(torch.sqrt(gwh / anchor_vec[a]) / 2)  # power method
 
-        # Width and height (power method)
-        # tw[b, a, gj, gi] = torch.sqrt(gw / anchor_wh[a, 0]) / 2
-        # th[b, a, gj, gi] = torch.sqrt(gh / anchor_wh[a, 1]) / 2
+        # Class
+        tcls.append(c)
 
-        # One-hot encoding of label
-        tcls[b, a, gj, gi, tc] = 1
-        tconf[b, a, gj, gi] = 1
+        # Conf
+        tci = torch.zeros_like(pred[i][..., 0])
+        tci[b, a, gj, gi] = 1  # conf
+        tconf.append(tci)
 
-    return tx, ty, tw, th, tconf, tcls
+    return txy, twh, tcls, tconf, indices
 
 
 def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
     """
-    Removes detections with lower object confidence score than 'conf_thres' and performs
+    Removes detections with lower object confidence score than 'conf_thres'
     Non-Maximum Suppression to further filter detections.
     Returns detections with shape:
         (x1, y1, x2, y2, object_conf, class_score, class_pred)
@@ -302,34 +342,6 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
 
     output = [None for _ in range(len(prediction))]
     for image_i, pred in enumerate(prediction):
-        # Filter out confidence scores below threshold
-        # Get score and class with highest confidence
-
-        # cross-class NMS (experimental)
-        cross_class_nms = False
-        if cross_class_nms:
-            a = pred.clone()
-            _, indices = torch.sort(-a[:, 4], 0)  # sort best to worst
-            a = a[indices]
-            radius = 30  # area to search for cross-class ious
-            for i in range(len(a)):
-                if i >= len(a) - 1:
-                    break
-
-                close = (torch.abs(a[i, 0] - a[i + 1:, 0]) < radius) & (torch.abs(a[i, 1] - a[i + 1:, 1]) < radius)
-                close = close.nonzero()
-
-                if len(close) > 0:
-                    close = close + i + 1
-                    iou = bbox_iou(a[i:i + 1, :4], a[close.squeeze(), :4].reshape(-1, 4), x1y1x2y2=False)
-                    bad = close[iou > nms_thres]
-
-                    if len(bad) > 0:
-                        mask = torch.ones(len(a)).type(torch.ByteTensor)
-                        mask[bad] = 0
-                        a = a[mask]
-            pred = a
-
         # Experiment: Prior class size rejection
         # x, y, w, h = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
         # a = w * h  # area
@@ -343,9 +355,9 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
         # shape_likelihood[:, c] =
         #   multivariate_normal.pdf(x, mean=mat['class_mu'][c, :2], cov=mat['class_cov'][c, :2, :2])
 
+        # Filter out confidence scores below threshold
         class_prob, class_pred = torch.max(F.softmax(pred[:, 5:], 1), 1)
-
-        v = ((pred[:, 4] > conf_thres) & (class_prob > .3))  # TODO examine arbitrary 0.3 thres here
+        v = pred[:, 4] > conf_thres
         v = v.nonzero().squeeze()
         if len(v.shape) == 0:
             v = v.unsqueeze(0)
@@ -365,66 +377,86 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
         # Detections ordered as (x1, y1, x2, y2, obj_conf, class_prob, class_pred)
         detections = torch.cat((pred[:, :5], class_prob.float().unsqueeze(1), class_pred.float().unsqueeze(1)), 1)
         # Iterate through all predicted classes
-        unique_labels = detections[:, -1].cpu().unique()
-        if prediction.is_cuda:
-            unique_labels = unique_labels.cuda(prediction.device)
+        unique_labels = detections[:, -1].cpu().unique().to(prediction.device)
 
-        nms_style = 'OR'  # 'AND' or 'OR' (classical)
+        nms_style = 'OR'  # 'OR' (default), 'AND', 'MERGE' (experimental)
         for c in unique_labels:
-            # Get the detections with the particular class
-            det_class = detections[detections[:, -1] == c]
-            # Sort the detections by maximum objectness confidence
-            _, conf_sort_index = torch.sort(det_class[:, 4], descending=True)
-            det_class = det_class[conf_sort_index]
-            # Perform non-maximum suppression
+            # Get the detections with class c
+            dc = detections[detections[:, -1] == c]
+            # Sort the detections by maximum object confidence
+            _, conf_sort_index = torch.sort(dc[:, 4] * dc[:, 5], descending=True)
+            dc = dc[conf_sort_index]
+
+            # Non-maximum suppression
             det_max = []
+            ind = list(range(len(dc)))
+            if nms_style == 'OR':  # default
+                while len(ind):
+                    j = ind[0]
+                    det_max.append(dc[j:j + 1])  # save highest conf detection
+                    reject = bbox_iou(dc[j], dc[ind]) > nms_thres
+                    [ind.pop(i) for i in reversed(reject.nonzero())]
+                # while dc.shape[0]:  # SLOWER METHOD
+                #     det_max.append(dc[:1])  # save highest conf detection
+                #     if len(dc) == 1:  # Stop if we're at the last detection
+                #         break
+                #     iou = bbox_iou(dc[0], dc[1:])  # iou with other boxes
+                #     dc = dc[1:][iou < nms_thres]  # remove ious > threshold
 
-            if nms_style == 'OR':  # Classical NMS
-                while det_class.shape[0]:
-                    # Get detection with highest confidence and save as max detection
-                    det_max.append(det_class[0].unsqueeze(0))
-                    # Stop if we're at the last detection
-                    if len(det_class) == 1:
-                        break
-                    # Get the IOUs for all boxes with lower confidence
-                    ious = bbox_iou(det_max[-1], det_class[1:])
+                # Image      Total          P          R        mAP
+                #  4964       5000      0.629      0.594      0.586
 
-                    # Remove detections with IoU >= NMS threshold
-                    det_class = det_class[1:][ious < nms_thres]
+            elif nms_style == 'AND':  # requires overlap, single boxes erased
+                while len(dc) > 1:
+                    iou = bbox_iou(dc[0], dc[1:])  # iou with other boxes
+                    if iou.max() > 0.5:
+                        det_max.append(dc[:1])
+                    dc = dc[1:][iou < nms_thres]  # remove ious > threshold
 
-            elif nms_style == 'AND':  # 'AND'-style NMS: >=2 boxes must share commonality to pass, single boxes erased
-                while det_class.shape[0]:
-                    if len(det_class) == 1:
-                        break
+            elif nms_style == 'MERGE':  # weighted mixture box
+                while len(dc) > 0:
+                    iou = bbox_iou(dc[0], dc[0:])  # iou with other boxes
+                    i = iou > nms_thres
 
-                    ious = bbox_iou(det_class[:1], det_class[1:])
+                    weights = dc[i, 4:5] * dc[i, 5:6]
+                    dc[0, :4] = (weights * dc[i, :4]).sum(0) / weights.sum()
+                    det_max.append(dc[:1])
+                    dc = dc[iou < nms_thres]
 
-                    if ious.max() > 0.5:
-                        det_max.append(det_class[0].unsqueeze(0))
-
-                    # Remove detections with IoU >= NMS threshold
-                    det_class = det_class[1:][ious < nms_thres]
+                # Image      Total          P          R        mAP
+                #  4964       5000      0.633      0.598      0.589  # normal
 
             if len(det_max) > 0:
-                det_max = torch.cat(det_max).data
+                det_max = torch.cat(det_max)
                 # Add max detections to outputs
                 output[image_i] = det_max if output[image_i] is None else torch.cat((output[image_i], det_max))
 
     return output
 
 
+def get_yolo_layers(model):
+    bool_vec = [x['type'] == 'yolo' for x in model.module_defs]
+    return [i for i, x in enumerate(bool_vec) if x]  # [82, 94, 106] for yolov3
+
+
+def return_torch_unique_index(u, uv):
+    n = uv.shape[1]  # number of columns
+    first_unique = torch.zeros(n, device=u.device).long()
+    for j in range(n):
+        first_unique[j] = (uv[:, j:j + 1] == u).all(0).nonzero()[0]
+
+    return first_unique
+
+
 def strip_optimizer_from_checkpoint(filename='weights/best.pt'):
     # Strip optimizer from *.pt files for lighter files (reduced by 2/3 size)
-    import torch
     a = torch.load(filename, map_location='cpu')
     a['optimizer'] = []
     torch.save(a, filename.replace('.pt', '_lite.pt'))
 
 
 def coco_class_count(path='../coco/labels/train2014/'):
-    # histogram of occurrences per class
-    import glob
-
+    # Histogram of occurrences per class
     nC = 80  # number classes
     x = np.zeros(nC, dtype='int32')
     files = sorted(glob.glob('%s/*.*' % path))
@@ -434,21 +466,29 @@ def coco_class_count(path='../coco/labels/train2014/'):
         print(i, len(files))
 
 
-def plot_results():
-    # Plot YOLO training results file 'results.txt'
-    import glob
-    import matplotlib.pyplot as plt
-    # import os; os.system('rm -rf results.txt && wget https://storage.googleapis.com/ultralytics/results_v1_0.txt')
+def coco_only_people(path='../coco/labels/val2014/'):
+    # Find images with only people
+    files = sorted(glob.glob('%s/*.*' % path))
+    for i, file in enumerate(files):
+        labels = np.loadtxt(file, dtype=np.float32).reshape(-1, 5)
+        if all(labels[:, 0] == 0):
+            print(labels.shape[0], file)
 
-    plt.figure(figsize=(16, 8))
-    s = ['X', 'Y', 'Width', 'Height', 'Objectness', 'Classification', 'Total Loss', 'Precision', 'Recall', 'mAP']
+
+def plot_results(start=0):
+    # Plot YOLO training results file 'results.txt'
+    # import os; os.system('wget https://storage.googleapis.com/ultralytics/yolov3/results_v3.txt')
+    # from utils.utils import *; plot_results()
+
+    plt.figure(figsize=(14, 7))
+    s = ['X + Y', 'Width + Height', 'Confidence', 'Classification', 'Total Loss', 'Precision', 'Recall', 'mAP']
     files = sorted(glob.glob('results*.txt'))
     for f in files:
-        results = np.loadtxt(f, usecols=[2, 3, 4, 5, 6, 7, 8, 17, 18, 16]).T  # column 16 is mAP
-        n = results.shape[1]
-        for i in range(10):
-            plt.subplot(2, 5, i + 1)
-            plt.plot(range(1, n), results[i, 1:], marker='.', label=f)
+        results = np.loadtxt(f, usecols=[2, 3, 4, 5, 6, 9, 10, 11]).T  # column 11 is mAP
+        x = range(1, results.shape[1])
+        for i in range(8):
+            plt.subplot(2, 4, i + 1)
+            plt.plot(results[i, x[start:]], marker='.', label=f)
             plt.title(s[i])
             if i == 0:
                 plt.legend()
