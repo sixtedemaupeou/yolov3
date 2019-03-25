@@ -20,7 +20,6 @@ def test(
         conf_thres=0.3,
         nms_thres=0.45,
         save_json=False,
-        model=None
 ):
     device = torch_utils.select_device()
 
