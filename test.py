@@ -12,6 +12,7 @@ from utils.utils import *
 
 def test(
         model,
+        device,
         data_cfg,
         batch_size=16,
         img_size=416,
@@ -20,20 +21,6 @@ def test(
         nms_thres=0.45,
         save_json=False,
 ):
-    device = torch_utils.select_device()
-
-#    test_path = 'coco/5k.part' # linux (cloud, i.e. gcp)
-#    if platform.system() == 'Darwin':  # MacOS (local)
-#        test_path = data_cfg_dict['valid']
-    if model is None:
-        # Initialize model
-        model = Darknet(cfg, img_size).to(device)
-
-        # Load weights
-        if weights.endswith('.pt'):  # pytorch format
-            model.load_state_dict(torch.load(weights, map_location=device)['model'])
-        else:  # darknet format
-            _ = load_darknet_weights(model, weights)
 
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
@@ -120,9 +107,9 @@ def test(
 
             # Compute Average Precision (AP) per class
             AP, AP_class, R, P = ap_per_class(tp=np.array(correct),
-                                              conf=detections[:, 4].cpu().numpy(),
-                                              pred_cls=detections[:, 6].cpu().numpy(),
-                                              target_cls=target_cls.cpu().numpy())
+                                              conf=detections[:, 4].cpu().detach().numpy(),
+                                              pred_cls=detections[:, 6].cpu().detach().numpy(),
+                                              target_cls=target_cls.cpu().detach().numpy())
 
             # Accumulate AP per class
             AP_accum_count += np.bincount(AP_class, minlength=nC)
@@ -187,16 +174,17 @@ if __name__ == '__main__':
 
     with torch.no_grad():
         # Initialize model
-        mdl = Darknet(opt.cfg, opt.img_size)
-
+        dvc = torch_utils.select_device()
+        mdl = Darknet(opt.cfg, opt.img_size).to(dvc)
         # Load weights
         if opt.weights.endswith('.pt'):  # pytorch format
-            mdl.load_state_dict(torch.load(opt.weights, map_location='cpu')['model'])
+            mdl.load_state_dict(torch.load(opt.weights, map_location=dvc)['model'])
         else:  # darknet format
-            load_darknet_weights(mdl, opt.weights)
+            _ = load_darknet_weights(mdl, opt.weights)
 
         mAP = test(
             mdl,
+            dvc,
             opt.data_cfg,
             opt.batch_size,
             opt.img_size,

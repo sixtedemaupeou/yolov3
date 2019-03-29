@@ -9,17 +9,16 @@ from utils.utils import *
 
 def init_model(cfg, weights, img_size=416):
     # Initialize model
-    model = Darknet(cfg, img_size=img_size)
+    device = torch_utils.select_device()
+    model = Darknet(cfg, img_size).to(device)
 
     # Load weights
     if weights.endswith('.pt'):  # pytorch format
-        if weights.endswith('yolov3.pt') and not os.path.isfile(weights) and (platform == 'darwin'):
-            os.system('wget https://storage.googleapis.com/ultralytics/yolov3.pt -O ' + weights)
-        model.load_state_dict(torch.load(weights, map_location='cpu')['model'])
+        model.load_state_dict(torch.load(weights, map_location=device)['model'])
     else:  # darknet format
-        load_darknet_weights(model, weights)
+        _ = load_darknet_weights(model, weights)
 
-    return model
+    return model, device
 
 
 def detect(
