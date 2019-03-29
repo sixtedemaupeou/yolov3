@@ -1,7 +1,5 @@
 import argparse
-import shutil
 import time
-from pathlib import Path
 from sys import platform
 
 from models import *
@@ -46,7 +44,7 @@ def detect(
 
     # Get classes and colors
     classes = load_classes(parse_data_cfg('cfg/coco.data')['names'])
-    colors = [[random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)] for _ in range(len(classes))]
+    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(classes))]
 
     result = []
 
@@ -77,20 +75,16 @@ def detect(
                 print('%g %ss' % (n, classes[int(c)]), end=', ')
 
             # Draw bounding boxes and labels of detections
-            for x1, y1, x2, y2, conf, cls_conf, cls in detections:
+            for *xyxy, conf, cls_conf, cls in detections:
                 if save_txt:  # Write to file
                     with open(save_path + '.txt', 'a') as file:
-                        file.write('%g %g %g %g %g %g\n' %
-                                   (x1, y1, x2, y2, cls, cls_conf * conf))
+                        file.write(('%g ' * 6 + '\n') % (*xyxy, cls, cls_conf * conf))
 
                 # Add bbox to the image
                 label = '%s %.2f' % (classes[int(cls)], conf)
-                plot_one_box([x1, y1, x2, y2], im0, label=label, color=colors[int(cls)])
+                plot_one_box(xyxy, im0, label=label, color=colors[int(cls)])
 
-            result.append(detections)
-
-        dt = time.time() - t
-        print('Done. (%.3fs)' % dt)
+        print('Done. (%.3fs)' % (time.time() - t))
 
         if save_images:  # Save generated image with detections
             cv2.imwrite(save_path, im0)
