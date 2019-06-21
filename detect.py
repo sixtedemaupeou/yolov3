@@ -82,7 +82,7 @@ def detect(
                 # Add bbox to the image
                 label = '%s %.2f' % (classes[int(cls)], conf)
                 plot_one_box(xyxy, im0, label=label, color=colors[int(cls)])
-
+            result.append(detections)
         print('Done. (%.3fs)' % (time.time() - t))
 
         if save_images:  # Save generated image with detections
